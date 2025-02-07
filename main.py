@@ -1,96 +1,137 @@
-import pandas as pd
-import yfinance as yf
-import plotly.express as px
 import streamlit as st
+import yfinance as yf
+import torch
+from torch import nn
 import numpy as np
-from alpha_vantage.timeseries import TimeSeries
-from alpha_vantage.fundamentaldata import FundamentalData
-import openai
+import pandas as pd
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from datetime import datetime
+import altair as alt
 
-# Set up your OpenAI GPT API key (ensure it's kept secure)
-openai.api_key = "Your GPT API KEY"
+class LSTM(nn.Module):
+    def __init__(self, input_size=4, hidden_layer_size=100, output_size=1):
+        super().__init__()
+        self.hidden_layer_size = hidden_layer_size
+        self.lstm = nn.LSTM(input_size, hidden_layer_size)
+        self.linear = nn.Linear(hidden_layer_size, output_size)
 
-st.title("Stock Dashboard")
+    def forward(self, input_seq):
+        hidden_cell = (torch.zeros(1, 1, self.hidden_layer_size),
+                       torch.zeros(1, 1, self.hidden_layer_size))
+        lstm_out, hidden_cell = self.lstm(input_seq.view(len(input_seq), 1, -1), hidden_cell)
+        predictions = self.linear(lstm_out.view(len(input_seq), -1))
+        return predictions[-1]
 
-# Sidebar input for ticker and date range
-ticker = st.sidebar.text_input("Ticker (e.g., AAPL, MSFT)")
-start_date = st.sidebar.date_input("Start Date")
-end_date = st.sidebar.date_input("End Date")
+# Streamlit UI
+st.title("Stock Price Prediction Dashboard")
 
-# Validate input and handle errors
-if not ticker:
-    st.warning("Please enter a valid ticker symbol.")
-elif start_date >= end_date:
-    st.warning("End date must be after the start date.")
+# Stock selection
+ticker = st.text_input("Enter a stock ticker (e.g., AAPL, TSLA):", "AAPL")
+
+# Fetch historical stock data
+data = yf.download(ticker, period="1y", interval="1d")
+if data.empty:
+    st.error("Invalid ticker or no data available!")
 else:
-    # Download data
-    data = yf.download(ticker, start=start_date.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'))
+    st.success("Data fetched successfully!")
 
-    # Check if data is empty
-    if data.empty:
-        st.warning(f"No data available for {ticker} between {start_date} and {end_date}.")
-    else:
-        # Plot data (using 'Close' as a fallback for missing 'Adj Close')
-        fig = px.line(data, x=data.index, y=data.get('Adj Close', data['Close']), title=f"{ticker} Price Movement")
-        st.plotly_chart(fig, use_container_width=True)
+    # Preprocess data
+    stock_data = data[['High', 'Low', 'Open', 'Close']]
+    scaler = MinMaxScaler(feature_range=(-1, 1))
+    scaled_data = scaler.fit_transform(stock_data.values)
 
-        # Pricing Data Section
-        st.header("Price Movement")
-        data['%change'] = data['Close'].pct_change()  # Use Close for % change calculation
-        data.dropna(inplace=True)
-        st.dataframe(data)  # Display the data in a structured format
-        annual_returns = data['%change'].mean() * 252 * 100
-        st.write("Annual Return is", f"{annual_returns:.2f}%")
-        stdev = np.std(data['%change']) * np.sqrt(252)
-        st.write("Standard Deviation is", f"{stdev * 100:.2f}%")
-        st.write('Risk Adj. Return is', f"{annual_returns / stdev:.2f}")
+    train_window = 7
+    def create_sequences(data, tw):
+        sequences = []
+        L = len(data)
+        for i in range(L - tw):
+            seq = data[i:i + tw]
+            label = data[i + tw][3]
+            sequences.append((seq, label))
+        return sequences
 
-        # Fundamental Data Section
-        st.header("Fundamental Data")
+    data_sequences = create_sequences(scaled_data, train_window)
+    train_size = int(len(data_sequences) * 0.8)
+    train_data = data_sequences[:train_size]
+    test_data = data_sequences[train_size:]
 
-        # Use a secure method to retrieve your API key, such as environment variables
-        key = 'YOUR_ALPHA_VANTAGE_API_KEY'  # Replace with your actual Alpha Vantage API key
-        fd = FundamentalData(key, output_format='pandas')
+    # Model setup
+    model = LSTM()
+    loss_function = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
-        st.subheader('Balance Sheet')
-        try:
-            balance_sheet = fd.get_balance_sheet_annual(ticker)[0]
-            bs = balance_sheet.T[2:]
-            bs.columns = list(balance_sheet.T.iloc[0])
-            st.write(bs)
-        except Exception as e:
-            st.warning(f"Error fetching balance sheet: {e}")
+    # Training
+    epochs = 5
+    for epoch in range(epochs):
+        model.train()
+        epoch_loss = 0
+        for seq, labels in train_data:
+            seq = torch.FloatTensor(seq)
+            labels = torch.FloatTensor([labels])
 
-        st.subheader('Income Statement')
-        try:
-            income_statement = fd.get_income_statement_annual(ticker)[0]
-            is1 = income_statement.T[2:]
-            is1.columns = list(income_statement.T.iloc[0])
-            st.write(is1)
-        except Exception as e:
-            st.warning(f"Error fetching income statement: {e}")
+            optimizer.zero_grad()
+            y_pred = model(seq)
+            loss = loss_function(y_pred, labels)
+            loss.backward()
+            optimizer.step()
 
-        st.subheader('Cash Flow Statement')
-        try:
-            cash_flow = fd.get_cash_flow_annual(ticker)[0]
-            cf = cash_flow.T[2:]
-            cf.columns = list(cash_flow.T.iloc[0])
-            st.write(cf)
-        except Exception as e:
-            st.warning(f"Error fetching cash flow statement: {e}")
+            epoch_loss += loss.item()
 
-        # User input for market questions
-        user_input = st.text_input("Ask me anything about stocks or the market.")
+    st.write(f"Training Completed. Final loss: {epoch_loss / len(train_data):.6f}")
 
-        # Query ChatGPT for response
-        if user_input:
-            try:
-                response = openai.Completion.create(
-                    engine="text-davinci-003",
-                    prompt=user_input,
-                    max_tokens=150
-                )
-                st.write("ChatGPT's Response:")
-                st.write(response['choices'][0]['text'].strip())
-            except Exception as e:
-                st.warning(f"Error querying ChatGPT: {e}")
+    # Evaluation
+    model.eval()
+    predictions = []
+    actual_values = []
+    for seq, label in test_data:
+        seq = torch.FloatTensor(seq)
+        with torch.no_grad():
+            pred = model(seq).item()
+        predictions.append(pred)
+        actual_values.append(label)
+
+    # Rescale predictions and actual values back to original scale
+    predictions = scaler.inverse_transform(np.c_[np.zeros(len(predictions)), np.zeros(len(predictions)), np.zeros(len(predictions)), predictions])[:, 3]
+    actual_values = scaler.inverse_transform(np.c_[np.zeros(len(actual_values)), np.zeros(len(actual_values)), np.zeros(len(actual_values)), actual_values])[:, 3]
+
+    # Metrics
+    mae = mean_absolute_error(actual_values, predictions)
+    rmse = np.sqrt(mean_squared_error(actual_values, predictions))
+    st.write(f"Mean Absolute Error (MAE): {mae:.2f}")
+    st.write(f"Root Mean Squared Error (RMSE): {rmse:.2f}")
+
+    # Plot Predictions vs Actual Prices using Altair
+    df_predictions = pd.DataFrame({"Actual Prices": actual_values, "Predicted Prices": predictions})
+    df_predictions.reset_index(inplace=True)
+    df_predictions.rename(columns={"index": "Time"}, inplace=True)
+
+    chart = alt.Chart(df_predictions).transform_fold(
+        ["Actual Prices", "Predicted Prices"],
+        as_=["Category", "Price"]
+    ).mark_line().encode(
+        x="Time:Q",
+        y="Price:Q",
+        color="Category:N"
+    ).properties(
+        title="Actual vs Predicted Stock Prices"
+    )
+
+    st.altair_chart(chart, use_container_width=True)
+
+    # Display Historical Candle Chart
+    data.reset_index(inplace=True)
+    data["Date"] = pd.to_datetime(data["Date"])
+    candle_chart = alt.Chart(data.tail(60)).mark_rule(color="black").encode(
+        x="Date:T", y="Low:Q", y2="High:Q"
+    ).properties(
+        title="Candle Chart (Last 60 Days)"
+    ) + alt.Chart(data.tail(60)).mark_bar().encode(
+        x="Date:T", y="Open:Q", y2="Close:Q", color=alt.condition("datum.Open < datum.Close", alt.value("green"), alt.value("red"))
+    )
+
+    st.altair_chart(candle_chart, use_container_width=True)
+
+    # Display Stock Data Table
+    st.subheader("Historical Stock Data")
+    st.write(data.tail())
